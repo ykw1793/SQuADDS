@@ -154,6 +154,7 @@ The following tutorials are available to help you get started with `SQuADDS`:
 - [Tutorial 6: Adding Airbridges](https://lfl-lab.github.io/SQuADDS/source/tutorials/Tutorial-6_Adding_Airbridges.html)
 - [Tutorial 7: Simulate designs with palace](https://lfl-lab.github.io/SQuADDS/source/tutorials/Tutorial-7_Simulate_designs_with_palace.html)
 - [Tutorial 8: ML Interpolation in SQuADDS](https://lfl-lab.github.io/SQuADDS/source/tutorials/Tutorial-8_ML_interpolation_in_SQuADDS.html)
+- [Tutorial 9: Learning the Inverse Map](https://lfl-lab.github.io/SQuADDS/source/tutorials/Tutorial-9_Learing_the_Inverse_Design_Map.html)
 
 ---
 
@@ -208,13 +209,16 @@ For inquiries or support, please contact [Sadman Ahmed Shanto](mailto:shanto@usc
 | Priyangshu Chatterjee | IIT Kharagpur                      | Documentation contributor            |
 
 ## Developers
-- [shanto268](https://github.com/shanto268) - 386 contributions
+- [shanto268](https://github.com/shanto268) - 392 contributions
 - [elizabethkunz](https://github.com/elizabethkunz) - 17 contributions
 - [LFL-Lab](https://github.com/LFL-Lab) - 7 contributions
 - [NxtGenLegend](https://github.com/NxtGenLegend) - 1 contributions
 - [ethanzhen7](https://github.com/ethanzhen7) - 1 contributions
 - [PCodeShark25](https://github.com/PCodeShark25) - 1 contributions
 ---
+
+
+
 
 
 
