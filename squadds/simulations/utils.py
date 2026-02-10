@@ -92,17 +92,17 @@ def setMaterialProperties(projectname, designname, solutiontype="Eigenmode"):
     """
 
     aedt = Hfss(
-        projectname=projectname,
-        designname=designname,
+        project=projectname,
+        design=designname,
         solution_type=solutiontype,
-        new_desktop_session=False,
+        new_desktop=False,
         close_on_exit=False,
     )
 
     ultra_cold_silicon(aedt)
     delete_old_setups(aedt)
 
-    aedt.release_desktop(close_projects=False, close_desktop=False)
+    # aedt.release_desktop(close_projects=False, close_desktop=False)
 
 
 def ultra_cold_silicon(aedt):
