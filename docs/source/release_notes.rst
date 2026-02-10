@@ -1,6 +1,139 @@
 Release Notes
 =============
 
+Version 0.4.3 (2026-01-28)
+--------------------------
+
+* **Alpha Version 0.4.3**
+
+**Performance Improvements**
+
+- Great speedup of halfwave cavity workflows (**seconds now instead of minutes*!**)
+- Replaced `joblib` with NumPy vectorization in `Analyzer.find_closest`, making database queries instant and eliminating overhead.
+- Added `numba.prange` support for true multi-core CPU utilization during parameter extraction.
+
+**New Features**
+
+- `AnsysSimulator` is now stateful (stores `device_dict`).
+- Added `update_simulation_setup(target, **kwargs)` for granular hyperparameter updates:
+    - Supports `target="qubit"`, `"cavity_claw"`, `"coupler"`, `"generic"`, or `"all"`.
+    - Intelligently maps targets to correct setup dictionaries based on system type.
+    - Interactive confirmation for unknown parameters to prevent typos and for specifying more hyperparameters.
+- Added `get_simulation_setup(target)` to view current setup parameters in formatted tables.
+- `simulate()` now uses valid internal state if no argument is provided.
+- **Transparency:** Prints simulation hyperparameters securely before execution.
+- All three setups (`setup_qubit`, `setup_cavity_claw`, `setup_coupler`) now properly included in half-wave cavity dataframes.
+- Added `update_design_parameters(**kwargs)` for direct geometry modification.
+
+**Bug Fixes**
+
+- Corrected `N=4` (Quarter-Wave) hardcoding to `N=2` (Half-Wave) in `objects.py`.
+- Resolved `TerminatedWorkerError` by removing process-based parallelism in favor of vectorization.
+- Fixed `KeyError` in `run_eigenmode` for NCap simulations.
+- Fixed `SettingWithCopyWarning` and linting errors in `analysis.py`.
+
+**Improvements**
+
+- Cleaned up unused parallel processing methods and dependencies.
+- Improved code stability across operating systems (macOS, Windows, Linux).
+- Added `rich` for beautiful, colored terminal status outputs during simulations.
+
+---
+
+Version 0.4.2 (2026-01-27)
+--------------------------
+
+* **Alpha Version 0.4.2**
+
+**Bug Fixes**
+
+- Fixed a critical `Numba` compilation error in half-wave cavity calculations by replacing incompatible `Convert` utility calls with JIT-compatible implementations.
+
+---
+
+Version 0.4.1 (2026-01-23)
+--------------------------
+
+* **Alpha Version 0.4.1**
+
+**Improvements**
+
+- A more accurate coupling strength calculation, see :download:`g_derivation.pdf <resources/g_derivation.pdf>`
+
+**Bug Fixes**
+
+- Fixed a critical issue in Ansys simulations by pinning the ``pyaedt`` dependency to a compatible version (0.23).
+
+---
+
+Version 0.4.0 (2025-01-09)
+--------------------------
+
+* **Alpha Version 0.4.0 [MAJOR INFRASTRUCTURE RELEASE]**
+
+**Breaking Changes**
+
+- Migrated from ``setup.py`` to modern ``pyproject.toml`` (PEP 621)
+- Switched from ``qiskit-metal`` to ``quantum-metal>=0.5.0`` (ARM64 compatible)
+- Removed Conda-based installation; now uses ``uv`` for package management
+- Python 3.10+ required (dropped 3.9 support)
+- NumPy pinned to ``<2.0`` for quantum-metal compatibility
+
+**New Features**
+
+- Full native Apple Silicon (ARM64) support via quantum-metal
+- Modern ``uv`` package management for faster, more reliable installs
+- Added ``ruff`` linting to development dependencies
+- Added PySide6 for modern Qt GUI support
+- Cross-platform CI/CD testing on Python 3.10, 3.11, 3.12
+
+**Performance Improvements**
+
+- **~7x speedup** for half-wave cavity Hamiltonian parameter calculations
+- Added LRU caching for transmon E01/anharmonicity calculations
+- Pre-compute unique EC values before parallel processing to avoid redundant matrix diagonalizations
+- Vectorized EC calculation using numba for array processing
+- Optimized value mapping using numpy ``searchsorted`` (O(log n) instead of O(n))
+- Reduced transmon calculations from ~16.5M to ~1934 unique values for typical datasets
+
+**Infrastructure**
+
+- Replaced all CI/CD workflows with ``astral-sh/setup-uv`` action
+- Added ``uv.lock`` for reproducible builds
+- Updated Docker image to use uv instead of Conda
+- Modernized PyPI publishing with trusted publishing (OIDC)
+- Added ruff configuration in pyproject.toml
+
+**Dependencies Removed (Bloatware)**
+
+- ``memory_profiler`` (unused)
+- ``addict`` (unused)
+- ``dask`` (transitive)
+- ``pyarrow`` (transitive)
+- ``cython`` (build-time only)
+- ``qutip`` (transitive via scqubits)
+
+**Dependencies Added**
+
+- ``matplotlib`` (was missing)
+- ``shapely`` (was missing)
+- ``pyside6`` (for quantum-metal)
+- ``ruff`` (dev dependency)
+
+**Documentation**
+
+- Completely rewrote installation instructions for uv workflow
+- Updated developer notes with new development setup
+- Simplified getting started guide
+- Removed all Conda/environment.yml references
+
+**Bug Fixes**
+
+- Fixed deprecated ``HfFolder`` import (replaced with ``get_token()``)
+- Fixed version consistency checks in prepare-release workflow
+
+---
+
 Version 0.3.7 (2024-03-19)
 --------------------------
 
@@ -157,7 +290,7 @@ Version 0.2.36 (2024-07-06)
 **Improvements**
 
 - Added `chi` as a query parameter
-- Better and more intuitive API 
+- Better and more intuitive API
 - "hot reload" of `Analyzer` object
 - Updated documentation and tutorials
 - Added `release-drafter` for automated release notes
@@ -205,7 +338,7 @@ Version 0.2.33 (2024-03-14)
 * **Alpha Version 0.2.33**
 
 - Bug fixes in ansys_simulator code for whole device `sweep` functionality
-- Added multiple helper/utility methods for ansys simulations 
+- Added multiple helper/utility methods for ansys simulations
 - Methods added to clulate chi, full dispersive shift of the cavity
 - Updated `requirements.txt` and documentation
 - Added method to set `GITHUB_TOKEN`
@@ -240,7 +373,7 @@ Version 0.2.3 (2024-01-17)
 - Added functionality for adding to existing configurations
 
 - Completed Tutorial 3
-  
+
 
 Version 0.2.2 (2024-01-10)
 --------------------------
@@ -298,7 +431,5 @@ Version 0.1.6 (2023-12-20)
   - Interpolation logic based on our `paper <https://arxiv.org/>`_
 
   - Tutorials on basic usage, contribution, and simulation added
-  
+
   - pypi package created
-
-

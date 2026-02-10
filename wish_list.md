@@ -25,7 +25,7 @@ Refer to [contribution guidelines](CONTRIBUTING.md) for more information on how 
 
 ## Core:
 
-- **Speed up half-wave cavity operations and decrease memory usage** (e.g., speed up both one-time cost methods such as generating the dataset and local operations done at the edge)
+
 - **Create a simple API for users to contribute experimental data to SQuADDS_DB**
 - Handle cases where the user does not wish to specify a `resonator_type`
 - Improve system design for both the SQuADDS package and SQuADDS_DB
@@ -69,7 +69,8 @@ Refer to [contribution guidelines](CONTRIBUTING.md) for more information on how 
 
 ## Feature Requests:
 
-- add airbridge generation tool
+- DRY sims
+- async ansys
 - add chi to the complete df
 - Enable users to add methods with computation and append to `merged_df` for search in the `Analyzer` module
 - Allow users to pass a circuit from SQCircuits and SQuADDS to provide a first-guess physical layout in Qiskit Metal
@@ -79,7 +80,7 @@ Refer to [contribution guidelines](CONTRIBUTING.md) for more information on how 
     - [CircuitNet](https://github.com/aaanthonyyy/CircuitNet)
 - Incorporate [SCILLA](https://github.com/aspuru-guzik-group/scilla?tab=readme-ov-file) and/or its applications
 - Add interpolation of individual components (both API and UI)
-- Searching of half-wave resonator designs
+
 
 ## Boring but Necessary:
 

@@ -1,14 +1,16 @@
 """
 #!TODO: Generalize the half-wave cavity method usage
 """
+
+import os
+from functools import lru_cache
+
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-import psutil
-from joblib import Parallel, delayed
 from numba import jit, prange
 from pyEPR.calcs import Convert
-from scipy.constants import Planck, e, h, hbar, pi
+from scipy.constants import Planck, e, hbar
+from scipy.optimize import brentq
 from scqubits.core.transmon import Transmon
 
 from squadds.calcs.qubit import QubitHamiltonian
@@ -19,7 +21,50 @@ Constants
 ========================================================
 """
 # constants
-ϕ0 = hbar / (2 * e)   # Flux quantum (Weber)
+ϕ0 = hbar / (2 * e)  # Flux quantum (Weber)
+
+# Cache for transmon calculations - significantly speeds up repeated calculations
+# Round to 6 decimal places to increase cache hits for similar values
+_TRANSMON_CACHE_PRECISION = 6
+
+
+@lru_cache(maxsize=50000)
+def _cached_transmon_E01_alpha(EJ_rounded: float, EC_rounded: float, ncut: int = 30) -> tuple[float, float]:
+    """
+    Cached calculation of E01 and anharmonicity for a transmon.
+
+    Uses rounded EJ/EC values as cache keys to increase hit rate.
+    Cache can hold up to 50,000 unique (EJ, EC) pairs.
+
+    Returns:
+        tuple: (E01 in GHz, anharmonicity in MHz)
+    """
+    transmon = Transmon(EJ=EJ_rounded, EC=EC_rounded, ng=0, ncut=ncut)
+    E01 = transmon.E01()
+    alpha = transmon.anharmonicity() * 1e3  # MHz
+    return E01, alpha
+
+
+def get_transmon_E01_alpha(EJ: float, EC: float, ncut: int = 30) -> tuple[float, float]:
+    """
+    Get E01 and anharmonicity with caching.
+
+    Rounds values to increase cache hit rate while maintaining accuracy.
+    """
+    EJ_rounded = round(EJ, _TRANSMON_CACHE_PRECISION)
+    EC_rounded = round(EC, _TRANSMON_CACHE_PRECISION)
+    return _cached_transmon_E01_alpha(EJ_rounded, EC_rounded, ncut)
+
+
+def clear_transmon_cache():
+    """Clear the transmon calculation cache."""
+    _cached_transmon_E01_alpha.cache_clear()
+
+
+def get_transmon_cache_info():
+    """Get cache statistics."""
+    return _cached_transmon_E01_alpha.cache_info()
+
 
 """
 ========================================================
@@ -27,16 +72,18 @@ Numba decorated methods
 ========================================================
 """
 
+
 @jit(nopython=True)
 def Ec_from_Cs(Cs):
     """
     Calculate the charging energy (Ec) in GHz from the capacitance (Cs) in fF.
     """
     Cs_SI = Cs * 1e-15
-    Ec_Joules = (e ** 2) / (2 * Cs_SI)
+    Ec_Joules = (e**2) / (2 * Cs_SI)
     Ec_Hz = Ec_Joules / Planck
     Ec_GHz = Ec_Hz * 1e-9
     return Ec_GHz
+
 
 @jit(nopython=True)
 def EC_numba(cross_to_claw, cross_to_ground):
@@ -44,23 +91,148 @@ def EC_numba(cross_to_claw, cross_to_ground):
     EC = Ec_from_Cs(C_eff_fF)
     return EC
 
-@jit(nopython=True, parallel=True)
+
+@jit(nopython=True)
+def EC_numba_vectorized(cross_to_claw_arr, cross_to_ground_arr):
+    """Vectorized EC calculation for arrays - much faster than loop."""
+    n = len(cross_to_claw_arr)
+    result = np.empty(n, dtype=np.float32)
+    for i in range(n):
+        C_eff_fF = np.abs(cross_to_ground_arr[i]) + np.abs(cross_to_claw_arr[i])
+        result[i] = Ec_from_Cs(C_eff_fF)
+    return result
+
+
+@jit(nopython=True)
 def g_from_cap_matrix_numba(C, C_c, EJ, f_r, res_type, Z0=50):
     """
-    !TODO: resolve the error : \"The keyword argument 'parallel=True' was specified but no transformation for parallel execution was possible.\" for this method
+    Calculate coupling strength 'g' using the capacitance matrix formalism (numba-accelerated).
+
+    Uses the formula:
+        g = (C_g / sqrt(C_Q + C_g)) * sqrt(hbar * omega_r * e^2 / det(C)) * (E_J / (8 * E_C,Q))^(1/4)
+
+    where det(C) = (C_Q + C_g)(C_r + C_g) - C_g^2
+
+    Args:
+        - C (float): Qubit self-capacitance to ground, C_Q (in fF).
+        - C_c (float): Coupling capacitance, C_g (in fF).
+        - EJ (float): Josephson energy (in GHz).
+        - f_r (float): Resonator frequency (in GHz).
+        - res_type (str): 'half' or 'quarter' wave resonator.
+        - Z0 (float): Characteristic impedance (ohms). Default 50.
+
+    Returns:
+        - g (float): Coupling strength in MHz.
     """
-    C = np.abs(C)
-    C_c = np.abs(C_c)
-    C_q = C_c + C # fF
+    # Keep capacitances in fF (as per original convention), convert to F only where needed
+    C_Q_fF = np.abs(C)  # Qubit self-capacitance to ground (fF)
+    C_g_fF = np.abs(C_c)  # Coupling capacitance (fF)
+    # C_Q_fF + C_g_fF  # Total qubit capacitance (fF)
 
-    omega_r = 2 * np.pi * f_r * 1e9
+    # Convert to SI units (F) for the formula
+    C_Q = C_Q_fF * 1e-15  # F
+    C_g = C_g_fF * 1e-15  # F
+    C_q_total = C_Q + C_g  # F
 
-    EC = Ec_from_Cs(C_q)
+    # Angular resonator frequency
+    omega_r = 2 * np.pi * f_r * 1e9  # rad/s
 
+    # Resonator type factor: N=2 for half-wave, N=4 for quarter-wave
     res_type_factor = 2 if res_type == "half" else 4 if res_type == "quarter" else 1
 
-    g = (np.abs(C_c) / C_q) * omega_r * np.sqrt(res_type_factor * Z0 * e ** 2 / (hbar * np.pi)) * (EJ / (8 * EC)) ** (1 / 4)
-    return (g * 1E-6) / (2 * np.pi)  # MHz
+    # Resonator capacitance from transmission line model: C_r = pi / (N * omega_r * Z0)
+    C_r = np.pi / (res_type_factor * omega_r * Z0)  # F
+
+    # Capacitance matrix determinant: det(C) = (C_Q + C_g)(C_r + C_g) - C_g^2
+    det_C = C_q_total * (C_r + C_g) - C_g**2
+
+    # Effective qubit capacitance from the matrix
+    C_q_eff = det_C / (C_r + C_g)
+
+    # Charging energy from effective qubit capacitance
+    EC = Ec_from_Cs(C_q_eff * 1e15)
+
+    # Coupling strength using capacitance matrix formula
+    # g [J] = (C_g / sqrt(C_Sigma)) * sqrt(hbar * omega_r * e^2 / det(C)) * (EJ / (8 * EC))^(1/4)
+    # Note: This formula gives g in energy units (Joules), need to divide by hbar to get rad/s
+    g_J = (C_g / np.sqrt(C_q_total)) * np.sqrt(hbar * omega_r * e**2 / det_C) * (EJ / (8 * EC)) ** (1 / 4)
+
+    # Convert from Joules to MHz: g_MHz = g_J / hbar / (2*pi) / 1e6
+    return (g_J / hbar) * 1e-6 / (2 * np.pi)  # MHz
+
+
+@jit(nopython=True, parallel=True)
+def g_from_cap_matrix_vectorized(cross_to_ground_arr, cross_to_claw_arr, EJ_arr, cavity_freq_arr, res_type_val, Z0=50):
+    """
+    Vectorized calculation of g for arrays of inputs (numba-accelerated).
+    Much faster than looping in Python.
+
+    Args:
+        cross_to_ground_arr: Array of C_ground (fF)
+        cross_to_claw_arr: Array of C_coupling (fF)
+        EJ_arr: Array of EJ (GHz)
+        cavity_freq_arr: Array of resonator freq (GHz)
+        res_type_val: Integer (2 for half, 4 for quarter)
+        Z0: Characteristic impedance
+    """
+    n = len(cross_to_ground_arr)
+    result = np.empty(n, dtype=np.float32)
+
+    # Constants
+    hbar_val = 1.0545718e-34
+    e_val = 1.60217662e-19
+    pi_val = 3.141592653589793
+
+    # Common factors
+    factor1 = hbar_val * e_val**2
+
+    for i in prange(n):
+        C_Q_fF = np.abs(cross_to_ground_arr[i])
+        C_g_fF = np.abs(cross_to_claw_arr[i])
+
+        # Convert to SI units (F)
+        C_Q = C_Q_fF * 1e-15
+        C_g = C_g_fF * 1e-15
+        C_q_total = C_Q + C_g
+
+        f_r = cavity_freq_arr[i]
+        omega_r = 2 * pi_val * f_r * 1e9
+
+        # Resonator capacitance: C_r = pi / (N * omega_r * Z0)
+        C_r = pi_val / (res_type_val * omega_r * Z0)
+
+        # Capacitance matrix determinant
+        det_C = C_q_total * (C_r + C_g) - C_g**2
+
+        # Effective qubit capacitance
+        C_q_eff = det_C / (C_r + C_g)
+
+        # Charging energy from C_q_eff (inlined Ec_from_Cs logic for speed)
+        # Ec_GHz = e^2 / (2 * C_q_eff) / h / 1e9
+        # But we acturally use C_q_eff * 1e15 (fF) passed to Ec_from_Cs
+        # Let's reuse the Ec_from_Cs function since it's jitted
+        C_q_eff_fF = C_q_eff * 1e15
+        # Manual inline of Ec_from_Cs(C_q_eff_fF)
+        Cs_SI = C_q_eff_fF * 1e-15
+        Ec_Joules = (e_val**2) / (2 * Cs_SI)
+        Ec_Hz = Ec_Joules / 6.62607015e-34
+        EC = Ec_Hz * 1e-9
+
+        EJ = EJ_arr[i]
+
+        # g calculation
+        # g [J] = (C_g / sqrt(C_q_total)) * sqrt(hbar * omega_r * e^2 / det(C)) * (EJ / (8 * EC))^(1/4)
+        term1 = C_g / np.sqrt(C_q_total)
+        term2 = np.sqrt((factor1 * omega_r) / det_C)
+        term3 = (EJ / (8 * EC)) ** 0.25
+
+        g_J = term1 * term2 * term3
+
+        # Convert to MHz
+        g_MHz = (g_J / hbar_val) * 1e-6 / (2 * pi_val)
+        result[i] = g_MHz
+
+    return result
 
 
 class TransmonCrossHamiltonian(QubitHamiltonian):
@@ -76,6 +248,7 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
             - analysis: The analysis object associated with the Hamiltonian.
         """
         import scqubits as scq
+
         super().__init__(analysis)
         self.selected_resonator_type = analysis.selected_resonator_type
         scq.set_units("GHz")
@@ -87,7 +260,7 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
         Args:
             - data_frame: The DataFrame containing the data to be plotted.
         """
-        data_frame.plot(kind='box', subplots=True, layout=(1, 3), sharex=False, sharey=False)
+        data_frame.plot(kind="box", subplots=True, layout=(1, 3), sharex=False, sharey=False)
         plt.show()
 
     def EC(self, cross_to_claw, cross_to_ground):
@@ -102,7 +275,7 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
             - EC: The charging energy of the transmon qubit.
         """
         C_eff_fF = abs(cross_to_ground) + abs(cross_to_claw)
-        EC = Convert.Ec_from_Cs(C_eff_fF, units_in='fF',units_out='GHz')
+        EC = Convert.Ec_from_Cs(C_eff_fF, units_in="fF", units_out="GHz")
         return EC
 
     def _calculate_target_qubit_params(self, w_q, alpha, Z_0=50):
@@ -121,7 +294,7 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
         """
         EJ, EC = Transmon.find_EJ_EC(w_q, alpha)
         EJEC = EJ / EC
-        Lj = Convert.Lj_from_Ej(EJ, units_in='GHz', units_out='nH')
+        Lj = Convert.Lj_from_Ej(EJ, units_in="GHz", units_out="nH")
         self.EJ = EJ
         self.EC = EC
         self.EJEC = EJEC
@@ -141,7 +314,7 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
             - Lj: The Josephson inductance of the qubit.
         """
         EJ, EC = Transmon.find_EJ_EC(w_q, alpha)
-        Lj = Convert.Lj_from_Ej(EJ, units_in='GHz', units_out='nH')
+        Lj = Convert.Lj_from_Ej(EJ, units_in="GHz", units_out="nH")
         self.EJ = EJ
         self.Lj = Lj
         return EJ, Lj
@@ -165,36 +338,79 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
         """
         Calculate the target quantities (C_q, C_c, EJ, EC, EJ_EC_ratio) based on the given parameters.
 
+        Uses the capacitance matrix formula to solve for C_c numerically:
+            g = (C_g / sqrt(C_Sigma)) * sqrt(hbar * omega_r * e^2 / det(C)) * (E_J / (8 * E_C))^(1/4)
+
         Args:
-            - f_res: The resonator frequency.
-            - alpha: The anharmonicity of the qubit.
-            - g: The coupling strength between the qubit and the resonator.
-            - w_q: The qubit frequency.
-            - res_type: The type of resonator.
-            - Z_0: The characteristic impedance of the resonator.
+            - f_res: The resonator frequency (in GHz).
+            - alpha: The anharmonicity of the qubit (in GHz).
+            - g: The coupling strength between the qubit and the resonator (in MHz).
+            - w_q: The qubit frequency (in GHz).
+            - res_type: The type of resonator ('half' or 'quarter').
+            - Z_0: The characteristic impedance of the resonator (in ohms). Default is 50.
 
         Returns:
-            - C_q: The total capacitance of the qubit.
-            - C_c: The coupling capacitance between the qubit and the resonator.
-            - EJ: The Josephson energy of the qubit.
-            - EC: The charging energy of the qubit.
+            - C_q: The total capacitance of the qubit (in fF).
+            - C_c: The coupling capacitance between the qubit and the resonator (in fF).
+            - EJ: The Josephson energy of the qubit (in GHz).
+            - EC: The charging energy of the qubit (in GHz).
             - EJ_EC_ratio: The ratio of EJ to EC.
         """
         EJ, EC = Transmon.find_EJ_EC(w_q, alpha)
-        C_q = Convert.Cs_from_Ec(EC, units_in='GHz', units_out='fF')
-        omega_r = 2 * np.pi * f_res
-        if res_type == "half":
-            res_type = 2
-        elif res_type == "quarter":
-            res_type = 4
+        C_q_fF = Convert.Cs_from_Ec(EC, units_in="GHz", units_out="fF")  # Total qubit capacitance in fF
+        C_Sigma = C_q_fF * 1e-15  # Total qubit capacitance in F
+
+        omega_r = 2 * np.pi * f_res * 1e9  # Angular frequency in rad/s
+
+        # Resonator type factor
+        if res_type == "half" or res_type == 2:
+            res_type_factor = 2
+        elif res_type == "quarter" or res_type == 4:
+            res_type_factor = 4
         else:
-            raise ValueError("res_type must be either 'half' or 'quarter'")
-        prefactor = np.sqrt(res_type * Z_0 * e**2 / (hbar * np.pi)) * (EJ / (8 * EC))**(1/4)
-        denominator = omega_r * prefactor
-        numerator = g * C_q
-        C_c = numerator / denominator
+            raise ValueError("res_type must be 'half', 'quarter', 2, or 4")
+
+        # Resonator capacitance: C_r = pi / (N * omega_r * Z_0)
+        C_r = np.pi / (res_type_factor * omega_r * Z_0)  # in F
+
+        # Common factor in the g formula (gives g in Joules)
+        common_factor = np.sqrt(hbar * omega_r * e**2) * (EJ / (8 * EC)) ** (1 / 4)
+
+        # Target g in SI units (Joules)
+        # g_MHz -> g_Hz -> g_rad/s -> g_J
+        g_target_J = g * 1e6 * 2 * np.pi * hbar  # Convert from MHz (linear) to Joules
+
+        def g_residual(C_g):
+            """Residual function: g_calculated - g_target = 0"""
+            if C_g <= 0 or C_g >= C_Sigma:
+                return float("inf")
+            # Determinant: det(C) = C_Sigma * (C_r + C_g) - C_g^2
+            det_C = C_Sigma * (C_r + C_g) - C_g**2
+            if det_C <= 0:
+                return float("inf")
+            # g_calc is in Joules
+            g_calc_J = (C_g / np.sqrt(C_Sigma)) * (common_factor / np.sqrt(det_C))
+            return g_calc_J - g_target_J
+
+        # Solve for C_g numerically using Brent's method
+        # C_g must be positive and less than C_Sigma
+        C_g_min = 1e-18  # Small positive value
+        C_g_max = C_Sigma * 0.99  # Less than total capacitance
+
+        try:
+            C_c_F = brentq(g_residual, C_g_min, C_g_max, xtol=1e-20)
+        except ValueError:
+            # If brentq fails, fall back to a reasonable estimate
+            # This can happen if the target g is not achievable with the given parameters
+            raise ValueError(
+                f"Could not find a valid coupling capacitance for target g={g} MHz. "
+                f"The target coupling may be outside the achievable range for the given qubit parameters."
+            ) from ValueError
+
+        C_c_fF = C_c_F * 1e15  # Convert to fF
         EJ_EC_ratio = EJ / EC
-        return C_q, C_c, EJ, EC, EJ_EC_ratio
+
+        return C_q_fF, C_c_fF, EJ, EC, EJ_EC_ratio
 
     def g_and_alpha(self, C, C_c, f_q, EJ, f_r, res_type, Z0=50):
         """
@@ -216,9 +432,9 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
         C, C_c = abs(C) * 1e-15, abs(C_c) * 1e-15
         C_q = C + C_c
         g = self.g_from_cap_matrix(C, C_c, EJ, f_r, res_type, Z0)
-        EC = Convert.Ec_from_Cs(C_q, units_in='F', units_out='GHz')
+        EC = Convert.Ec_from_Cs(C_q, units_in="F", units_out="GHz")
         transmon = Transmon(EJ=EJ, EC=EC, ng=0, ncut=30)
-        alpha = transmon.anharmonicity() * 1E3  # MHz
+        alpha = transmon.anharmonicity() * 1e3  # MHz
         return g, alpha
 
     def g_alpha_freq(self, C, C_c, EJ, f_r, res_type, Z0=50):
@@ -237,6 +453,7 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
             - (g, alpha, freq) (tuple): A tuple containing the coupling strength (g), anharmonicity (alpha), and transition frequency (freq).
         """
         import scqubits as scq
+
         scq.set_units("GHz")
         C_q = C + C_c
         if res_type == "half":
@@ -246,20 +463,28 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
         else:
             raise ValueError("res_type must be either 'half' or 'quarter'")
         g = self.g_from_cap_matrix(C, C_c, EJ, f_r, res_type, Z0)
-        EC = Convert.Ec_from_Cs(C_q, units_in='fF', units_out='GHz')
+        EC = Convert.Ec_from_Cs(C_q, units_in="fF", units_out="GHz")
         transmon = Transmon(EJ=EJ, EC=EC, ng=0, ncut=30)
-        alpha = transmon.anharmonicity() * 1E3  # MHz
+        alpha = transmon.anharmonicity() * 1e3  # MHz
         freq = transmon.E01()
         return g, alpha, freq
 
     def g_from_cap_matrix(self, C, C_c, EJ, f_r, res_type, Z0=50):
         """
         Calculate the coupling strength 'g' between a transmon qubit and a resonator
-        based on the capacitance matrix.
+        based on the capacitance matrix formalism.
+
+        Uses the formula:
+            g = (C_g / sqrt(C_Q + C_g)) * sqrt(hbar * omega_r * e^2 / det(C)) * (E_J / (8 * E_C,Q))^(1/4)
+
+        where det(C) = (C_Q + C_g)(C_r + C_g) - C_g^2 is the determinant of the
+        capacitance matrix:
+            C = [[C_Q + C_g,    -C_g    ],
+                 [   -C_g,    C_r + C_g]]
 
         Args:
-            - C (float): Capacitance between the qubit and the resonator (in femtofarads, fF).
-            - C_c (float): Coupling capacitance of the resonator (in femtofarads, fF).
+            - C (float): Qubit self-capacitance to ground, C_Q (in femtofarads, fF).
+            - C_c (float): Coupling capacitance between qubit and resonator, C_g (in femtofarads, fF).
             - EJ (float): Josephson energy of the qubit (in GHz).
             - f_r (float): Resonator frequency (in GHz).
             - res_type (str): Type of resonator. Can be 'half' or 'quarter'.
@@ -268,20 +493,43 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
         Returns:
             - g (float): Coupling strength 'g' between the qubit and the resonator (in MHz).
         """
-        C = abs(C) * 1e-15  # F
-        C_c = abs(C_c) * 1e-15  # F
-        C_q = C_c + C
-        omega_r = 2 * np.pi * f_r * 1e9
-        EC = Convert.Ec_from_Cs(C_q, units_in='F', units_out='GHz')
+        # Convert capacitances from fF to F
+        C_Q = abs(C) * 1e-15  # Qubit self-capacitance to ground (F)
+        C_g = abs(C_c) * 1e-15  # Coupling capacitance (F)
 
-        if res_type == "half":
-            res_type = 2
-        elif res_type == "quarter":
-            res_type = 4
+        # Total qubit capacitance
+        C_q_total = C_Q + C_g
 
-        g = (abs(C_c) / C_q) * omega_r * np.sqrt(res_type * Z0 * e**2 / (hbar * np.pi)) * (EJ / (8 * EC))**(1/4)
-        return (g * 1E-6) / (2 * np.pi)  # MHz
+        # Angular resonator frequency
+        omega_r = 2 * np.pi * f_r * 1e9  # rad/s
 
+        # Resonator capacitance derived from transmission line model
+        # C_r = pi / (N * omega_r * Z0) where N=2 for half-wave, N=4 for quarter-wave
+        if res_type == "half" or res_type == 2:
+            res_type_factor = 2
+        elif res_type == "quarter" or res_type == 4:
+            res_type_factor = 4
+        else:
+            raise ValueError("res_type must be 'half', 'quarter', 2, or 4")
+
+        C_r = np.pi / (res_type_factor * omega_r * Z0)  # Resonator capacitance (F)
+
+        # Capacitance matrix determinant: det(C) = (C_Q + C_g)(C_r + C_g) - C_g^2
+        det_C = (C_q_total) * (C_r + C_g) - C_g**2
+
+        # Effective qubit capacitance from the matrix
+        C_q_eff = det_C / (C_r + C_g)
+
+        # Charging energy from effective qubit capacitance
+        EC = Convert.Ec_from_Cs(C_q_eff, units_in="F", units_out="GHz")
+
+        # Coupling strength using capacitance matrix formula
+        # g [J] = (C_g / sqrt(C_Q + C_g)) * sqrt(hbar * omega_r * e^2 / det(C)) * (E_J / (8 * E_C,Q))^(1/4)
+        # Note: This formula gives g in energy units (Joules), need to divide by hbar to get rad/s
+        g_J = (C_g / np.sqrt(C_q_total)) * np.sqrt(hbar * omega_r * e**2 / det_C) * (EJ / (8 * EC)) ** (1 / 4)
+
+        # Convert from Joules to MHz: g_MHz = g_J / hbar / (2*pi) / 1e6
+        return (g_J / hbar) * 1e-6 / (2 * np.pi)  # MHz
 
     def get_freq_alpha_fixed_LJ(self, fig4_df, LJ_target):
         """
@@ -295,16 +543,18 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
             - freq: List of frequencies of the transmons.
             - alpha: List of anharmonicities of the transmons.
         """
-        EJ = Convert.Ej_from_Lj(LJ_target, units_in='nH', units_out='GHz')
+        EJ = Convert.Ej_from_Lj(LJ_target, units_in="nH", units_out="GHz")
         EC = fig4_df["EC"].values
         transmons = [Transmon(EJ=EJ, EC=EC[i], ng=0, ncut=30) for i in range(len(EC))]
-        alpha = [transmon.anharmonicity() * 1E3 for transmon in transmons]
+        alpha = [transmon.anharmonicity() * 1e3 for transmon in transmons]
         freq = [transmon.E01() for transmon in transmons]
         return freq, alpha
 
     def E01_and_anharmonicity(self, EJ, EC, ng=0, ncut=30):
         """
         Calculate the energy of the first excited state (E01) and the anharmonicity (alpha) of a transmon qubit.
+
+        Uses cached calculations when ng=0 for significant speedup on large datasets.
 
         Args:
             - EJ (float): Josephson energy of the transmon qubit.
@@ -316,14 +566,21 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
             - E01 (float): Energy of the first excited state (E01) in GHz.
             - alpha (float): Anharmonicity (alpha) in MHz.
         """
+        # Use cached version for ng=0 (the common case)
+        if ng == 0:
+            return get_transmon_E01_alpha(EJ, EC, ncut)
+
+        # Fall back to direct calculation for non-zero ng
         transmon = Transmon(EJ=EJ, EC=EC, ng=ng, ncut=ncut)
         E01 = transmon.E01()
-        alpha = transmon.anharmonicity() * 1E3  # MHz
+        alpha = transmon.anharmonicity() * 1e3  # MHz
         return E01, alpha
 
     def E01(self, EJ, EC, ng=0, ncut=30):
         """
         Calculate the energy of the first excited state (E01) of a transmon qubit.
+
+        Uses cached calculations when ng=0 for significant speedup.
 
         Args:
             - EJ (float): Josephson energy of the transmon qubit.
@@ -334,6 +591,11 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
         Returns:
             - E01 (float): Energy of the first excited state (E01) of the transmon qubit.
         """
+        # Use cached version for ng=0
+        if ng == 0:
+            E01, _ = get_transmon_E01_alpha(EJ, EC, ncut)
+            return E01
+
         transmon = Transmon(EJ=EJ, EC=EC, ng=ng, ncut=ncut)
         E01 = transmon.E01()
         return E01
@@ -353,14 +615,20 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
         """
         EJ_target = self.EJ(self.target_params["qubit_frequency_GHz"], self.target_params["anharmonicity_MHz"] * 1e-3)
         self.df["EC"] = self.df.apply(lambda row: self.EC(row["cross_to_claw"], row["cross_to_ground"]), axis=1)
-        self.df['EJ'] = EJ_target
-        self.df['qubit_frequency_GHz'], self.df['anharmonicity_MHz'] = zip(*self.df.apply(lambda row: self.E01_and_anharmonicity(row['EJ'], row['EC']), axis=1))
+        self.df["EJ"] = EJ_target
+        self.df["qubit_frequency_GHz"], self.df["anharmonicity_MHz"] = zip(
+            *self.df.apply(lambda row: self.E01_and_anharmonicity(row["EJ"], row["EC"]), axis=1)
+        )
 
     def add_qubit_H_params_chunk(self, df):
         """
         Add qubit Hamiltonian parameters to the DataFrame chunk.
 
-        This method calculates and adds the qubit Hamiltonian parameters, such as EC, EJ, and EJEC,
+        This method calculates and adds the qubit Hamiltonian parameters, such as EC, EJ, and EJEC.
+
+        Optimization: Since EJ is constant for all rows, we only compute E01/anharmonicity
+        for unique EC values (rounded to reduce count), then map results back. This avoids
+        redundant Transmon instantiations and matrix diagonalizations.
 
         Args:
             - df: The DataFrame chunk to which the parameters will be added.
@@ -369,27 +637,44 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
             - df: The DataFrame chunk with the added parameters
         """
         EJ_target = self.EJ(self.target_params["qubit_frequency_GHz"], self.target_params["anharmonicity_MHz"] * 1e-3)
-        EJ_target = np.float32(EJ_target)  # Ensure memory-efficient data type
+        EJ_target = np.float32(EJ_target)
 
-        cross_to_claw_values = df["cross_to_claw"].values
-        cross_to_ground_values = df["cross_to_ground"].values
-        EC_values = np.array([EC_numba(claw, ground) for claw, ground in zip(cross_to_claw_values, cross_to_ground_values)], dtype=np.float32)
+        cross_to_claw_values = df["cross_to_claw"].values.astype(np.float64)
+        cross_to_ground_values = df["cross_to_ground"].values.astype(np.float64)
+        EC_values = EC_numba_vectorized(cross_to_claw_values, cross_to_ground_values)
 
         df["EC"] = EC_values
-        df['EJ'] = EJ_target
-        df['qubit_frequency_GHz'], df['anharmonicity_MHz'] = np.vectorize(self.E01_and_anharmonicity)(df['EJ'].values, df['EC'].values)
-        df['qubit_frequency_GHz'] = df['qubit_frequency_GHz'].astype(np.float32)
-        df['anharmonicity_MHz'] = df['anharmonicity_MHz'].astype(np.float32)
+        df["EJ"] = EJ_target
+
+        # Optimization: compute only for unique EC values, then map back
+        # Round EC to reduce unique count while maintaining accuracy
+        EC_rounded = np.round(EC_values, _TRANSMON_CACHE_PRECISION)
+        unique_ECs = np.unique(EC_rounded)
+
+        # Pre-compute E01 and alpha for all unique EC values
+        unique_results = {}
+        for ec in unique_ECs:
+            E01, alpha = get_transmon_E01_alpha(float(EJ_target), float(ec))
+            unique_results[ec] = (E01, alpha)
+
+        # Map results back to full array
+        freq_values = np.array([unique_results[ec][0] for ec in EC_rounded], dtype=np.float32)
+        alpha_values = np.array([unique_results[ec][1] for ec in EC_rounded], dtype=np.float32)
+
+        df["qubit_frequency_GHz"] = freq_values
+        df["anharmonicity_MHz"] = alpha_values
 
         return df
 
-
-    def add_cavity_coupled_H_params(self, num_chunks="auto",Z_0=50):
+    def add_cavity_coupled_H_params(self, num_chunks="auto", Z_0=50):
         """
         Add cavity-coupled Hamiltonian parameters to the dataframe.
 
         This method calculates the coupling strength 'g_MHz' between the transmon qubit and the cavity,
         based on the capacitance matrix, transmon parameters, cavity frequency, resonator type, and characteristic impedance.
+
+        Optimization: Pre-computes all unique transmon parameters in the main process before
+        parallel processing, avoiding redundant matrix diagonalizations across workers.
 
         Args:
             - num_chunks: The number of chunks to split the DataFrame into for parallel processing. Default is "auto" which sets the number of chunks to the number of logical CPUs.
@@ -400,71 +685,92 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
         """
         if self.selected_resonator_type == "half":
             if num_chunks == "auto":
-                num_chunks = psutil.cpu_count(logical=True)
-            elif num_chunks > psutil.cpu_count(logical=True):
-                raise ValueError(f"num_chunks must be less than or equal to {psutil.cpu_count(logical=True)}")
+                num_chunks = os.cpu_count() or 4
+            elif num_chunks > (os.cpu_count() or 4):
+                raise ValueError(f"num_chunks must be less than or equal to {os.cpu_count() or 4}")
             else:
                 num_chunks = 2
                 raise UserWarning("`num_chunk`s must be an integer greater than 0. Defaulting to 2.")
             print(f"Using {num_chunks} chunks for parallel processing")
-            self.df = self.parallel_process_dataframe(self.df, num_chunks)
+
+            # === OPTIMIZATION: Pre-compute all transmon values in main process ===
+            # Step 1: Calculate EJ (constant for all rows)
+            EJ_target = self.EJ(
+                self.target_params["qubit_frequency_GHz"], self.target_params["anharmonicity_MHz"] * 1e-3
+            )
+            EJ_target = float(EJ_target)
+
+            # Step 2: Calculate all EC values (vectorized, fast)
+            cross_to_claw = self.df["cross_to_claw"].values.astype(np.float64)
+            cross_to_ground = self.df["cross_to_ground"].values.astype(np.float64)
+            EC_all = EC_numba_vectorized(cross_to_claw, cross_to_ground)
+
+            # Step 3: Find unique EC values (rounded for efficiency)
+            EC_rounded = np.round(EC_all, _TRANSMON_CACHE_PRECISION)
+            unique_ECs = np.unique(EC_rounded)
+
+            # Step 4: Pre-compute E01 and alpha for all unique ECs
+            print(f"Computing transmon params for {len(unique_ECs)} unique EC values...", flush=True)
+            unique_E01 = np.empty(len(unique_ECs), dtype=np.float32)
+            unique_alpha = np.empty(len(unique_ECs), dtype=np.float32)
+            for i, ec in enumerate(unique_ECs):
+                E01, alpha = get_transmon_E01_alpha(EJ_target, float(ec))
+                unique_E01[i] = E01
+                unique_alpha[i] = alpha
+            print(f"Pre-computed {len(unique_ECs)} unique transmon states")
+
+            # Step 5: Create lookup arrays using numpy searchsorted for O(log n) lookup
+            # This is MUCH faster than a Python loop over 16.5M values
+            indices = np.searchsorted(unique_ECs, EC_rounded)
+
+            # Step 6: Vectorized mapping (fast numpy indexing)
+            freq_values = unique_E01[indices]
+            alpha_values = unique_alpha[indices]
+
+            # Step 7: Store in dataframe
+            self.df["EC"] = EC_all
+            self.df["EJ"] = np.float32(EJ_target)
+            self.df["qubit_frequency_GHz"] = freq_values
+            self.df["anharmonicity_MHz"] = alpha_values
+
+            # Step 8: Calculate g using vectorized Numba function (C-speed, no parallel overhead)
+            from numba import config
+
+            num_threads = config.NUMBA_NUM_THREADS
+            mode_str = f"parallel ({num_threads} threads)" if int(num_threads) > 1 else "serial"
+            print(f"Calculating g_MHz (vectorized) in {mode_str}...", flush=True)
+            res_type_val = 2 if self.selected_resonator_type == "half" else 4
+
+            # Prepare arrays for Numba
+            cross_to_ground = self.df["cross_to_ground"].values.astype(np.float64)
+            cross_to_claw = self.df["cross_to_claw"].values.astype(np.float64)
+            EJ_vals = self.df["EJ"].values.astype(np.float64)
+            freq_vals = self.df["cavity_frequency_GHz"].values.astype(np.float64)
+
+            # Execute vectorized calculation
+            g_values = g_from_cap_matrix_vectorized(
+                cross_to_ground, cross_to_claw, EJ_vals, freq_vals, res_type_val, Z_0
+            )
+
+            self.df["g_MHz"] = g_values
+            print("Done calculating g_MHz.")
+
         else:
             self.add_qubit_H_params()
-            self.df['g_MHz'] = self.df.apply(lambda row: self.g_from_cap_matrix(C=row['cross_to_ground'], 
-                            C_c=row['cross_to_claw'], 
-                            EJ=row['EJ'],
-                            f_r=row['cavity_frequency_GHz'],
-                            res_type=row['resonator_type'], 
-                            Z0=50), axis=1)
+            self.df["g_MHz"] = self.df.apply(
+                lambda row: self.g_from_cap_matrix(
+                    C=row["cross_to_ground"],
+                    C_c=row["cross_to_claw"],
+                    EJ=row["EJ"],
+                    f_r=row["cavity_frequency_GHz"],
+                    res_type=row["resonator_type"],
+                    Z0=50,
+                ),
+                axis=1,
+            )
 
-    def add_cavity_coupled_H_params_chunk(self, chunk, Z_0=50):
-        """
-        Add cavity-coupled Hamiltonian parameters to the DataFrame chunk.
-
-        This method calculates the coupling strength 'g_MHz' between the transmon qubit and the cavity,
-
-        Args:
-            - chunk: The DataFrame chunk to which the parameters will be added.
-            - Z_0: The characteristic impedance of the transmission line. Default is 50 ohms.
-
-        Returns:
-            - chunk: The DataFrame chunk with the added parameters.
-        """
-        chunk = self.add_qubit_H_params_chunk(chunk)
-
-        cross_to_ground_values = chunk['cross_to_ground'].values
-        cross_to_claw_values = chunk['cross_to_claw'].values
-        EJ_values = chunk['EJ'].values
-        cavity_frequency_values = chunk['cavity_frequency_GHz'].values
-
-        g_values = np.array([g_from_cap_matrix_numba(ground, claw, ej, freq, 'half', Z_0)
-                            for ground, claw, ej, freq in zip(cross_to_ground_values, cross_to_claw_values, EJ_values, cavity_frequency_values)], dtype=np.float32)
-
-        chunk['g_MHz'] = g_values
-
-        return chunk
-
-    def parallel_process_dataframe(self, df, num_chunks, Z_0 = 50):
-        """
-        Process the DataFrame in parallel.
-
-        This method splits the DataFrame into chunks and processes each chunk in parallel.
-
-        Args:
-            - df: The DataFrame to be processed.
-            - num_chunks: The number of chunks to split the DataFrame into.
-            - Z_0: The characteristic impedance of the transmission line. Default is 50
-
-        Returns:
-            - df: The DataFrame with the added parameters.
-
-        """
-        chunks = np.array_split(df, num_chunks)
-
-        with Parallel(n_jobs=num_chunks) as parallel:
-            results = parallel(delayed(self.add_cavity_coupled_H_params_chunk)(chunk, Z_0) for chunk in chunks)
-
-        return pd.concat(results)
+    # parallel_process_g_only and intermediate chunk methods removed
+    # as they are replaced by vectorized implementation.
 
     def chi(self, EJ, EC, g, f_r):
         """
@@ -482,11 +788,11 @@ class TransmonCrossHamiltonian(QubitHamiltonian):
         #!TODO: Speed up this calculation using numba
         omega_r = 2 * np.pi * f_r * 1e9
         transmon = Transmon(EJ=EJ, EC=EC, ng=0, ncut=30)
-        alpha = transmon.anharmonicity() * 1E3  # MHz, linear or angular
-        omega_q = transmon.E01() # is this in linear or angular frequency units
+        alpha = transmon.anharmonicity() * 1e3  # MHz, linear or angular
+        omega_q = transmon.E01()  # is this in linear or angular frequency units
         delta = omega_r - omega_q
         sigma = omega_r + omega_q
 
-        chi = 2 * g**2 * (alpha /(delta * (delta - alpha))- alpha/(sigma * (sigma + alpha)))
+        chi = 2 * g**2 * (alpha / (delta * (delta - alpha)) - alpha / (sigma * (sigma + alpha)))
 
         return chi
