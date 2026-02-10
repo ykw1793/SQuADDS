@@ -199,7 +199,7 @@ class SQuADDS_DB(metaclass=SingletonMeta):
                 data_types.append(config.split("-")[2])
             except:
                 pass
-        return data_types
+        return list(set(data_types))
 
     def supported_config_names(self):
         """
